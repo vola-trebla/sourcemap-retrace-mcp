@@ -130,14 +130,25 @@ export async function retrieveCodeContext(
   return [...header, ...body].join("\n");
 }
 
+function collectJsFiles(dir: string, _root: string): string[] {
+  const results: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...collectJsFiles(full, _root));
+    } else if (entry.name.endsWith(".js") && !entry.name.endsWith(".min.js.map")) {
+      results.push(full);
+    }
+  }
+  return results;
+}
+
 export async function auditSourcemapMatch(distDir: string): Promise<string> {
   if (!fs.existsSync(distDir)) {
     return `Error: directory not found: ${distDir}`;
   }
 
-  const jsFiles = fs
-    .readdirSync(distDir)
-    .filter((f) => f.endsWith(".js") && !f.endsWith(".min.js.map"));
+  const jsFiles = collectJsFiles(distDir, distDir);
 
   if (jsFiles.length === 0) {
     return `Sourcemap Audit\n  Directory: ${distDir}\n\n  No .js files found.`;
@@ -148,12 +159,12 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
   let brokenSources = 0;
   let ok = 0;
 
-  for (const jsFile of jsFiles) {
-    const jsPath = path.join(distDir, jsFile);
+  for (const jsPath of jsFiles) {
+    const relPath = path.relative(distDir, jsPath);
     const mapPath = jsPath + ".map";
 
     if (!fs.existsSync(mapPath)) {
-      rows.push(`  ✗ ${jsFile} — no .map file`);
+      rows.push(`  ✗ ${relPath} — no .map file`);
       missingMaps++;
       continue;
     }
@@ -162,7 +173,7 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
     try {
       parsed = JSON.parse(fs.readFileSync(mapPath, "utf-8")) as { sources?: string[] };
     } catch {
-      rows.push(`  ✗ ${jsFile} — .map file is invalid JSON`);
+      rows.push(`  ✗ ${relPath} — .map file is invalid JSON`);
       brokenSources++;
       continue;
     }
@@ -176,12 +187,12 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
     });
 
     if (missing.length > 0) {
-      rows.push(`  ⚠ ${jsFile} — ${missing.length} source(s) not found on disk:`);
+      rows.push(`  ⚠ ${relPath} — ${missing.length} source(s) not found on disk:`);
       missing.slice(0, 3).forEach((s) => rows.push(`      ${s}`));
       if (missing.length > 3) rows.push(`      ... and ${missing.length - 3} more`);
       brokenSources++;
     } else {
-      rows.push(`  ✓ ${jsFile} — ${sources.length} source(s) mapped`);
+      rows.push(`  ✓ ${relPath} — ${sources.length} source(s) mapped`);
       ok++;
     }
   }
