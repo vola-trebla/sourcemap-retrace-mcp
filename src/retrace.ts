@@ -1,6 +1,6 @@
-import * as fs from "fs";
-import * as path from "path";
-import { TraceMap, originalPositionFor } from "@jridgewell/trace-mapping";
+import * as fs from 'fs';
+import * as path from 'path';
+import { TraceMap, originalPositionFor } from '@jridgewell/trace-mapping';
 
 // Handles both formats:
 //   at FunctionName (file.js:line:col)
@@ -11,7 +11,7 @@ const mapCache = new Map<string, TraceMap | null>();
 
 function loadMap(mapPath: string): TraceMap | null {
   try {
-    return new TraceMap(fs.readFileSync(mapPath, "utf-8"));
+    return new TraceMap(fs.readFileSync(mapPath, 'utf-8'));
   } catch {
     return null;
   }
@@ -23,9 +23,9 @@ function findMap(jsRef: string, sourcemapDir: string): TraceMap | null {
   if (mapCache.has(cacheKey)) return mapCache.get(cacheKey) ?? null;
 
   const candidates = [
-    path.join(sourcemapDir, basename + ".map"),
-    path.join(sourcemapDir, basename.replace(/\.js$/, ".js.map")),
-    jsRef + ".map",
+    path.join(sourcemapDir, basename + '.map'),
+    path.join(sourcemapDir, basename.replace(/\.js$/, '.js.map')),
+    jsRef + '.map',
   ];
 
   for (const candidate of candidates) {
@@ -45,7 +45,7 @@ export async function retraceStack(stackTrace: string, sourcemapDir: string): Pr
     return `Error: sourcemap directory not found: ${sourcemapDir}`;
   }
 
-  const lines = stackTrace.split("\n");
+  const lines = stackTrace.split('\n');
   const output: string[] = [];
   let mappedCount = 0;
   let unmappedCount = 0;
@@ -72,7 +72,7 @@ export async function retraceStack(stackTrace: string, sourcemapDir: string): Pr
     try {
       const pos = originalPositionFor(traceMap, { line: lineNum, column: colNum });
       if (pos.source !== null) {
-        const displayName = pos.name ?? fnName ?? "<anonymous>";
+        const displayName = pos.name ?? fnName ?? '<anonymous>';
         output.push(`    at ${displayName} (${pos.source}:${pos.line}:${pos.column})`);
         mappedCount++;
       } else {
@@ -86,7 +86,7 @@ export async function retraceStack(stackTrace: string, sourcemapDir: string): Pr
   }
 
   const summary = `Retrace Results\n  Frames mapped: ${mappedCount}  |  Unmapped: ${unmappedCount}\n`;
-  return [summary, ...output].join("\n");
+  return [summary, ...output].join('\n');
 }
 
 export async function retrieveCodeContext(
@@ -99,7 +99,7 @@ export async function retrieveCodeContext(
     return `Error: file not found: ${originalFile}`;
   }
 
-  const allLines = fs.readFileSync(originalFile, "utf-8").split("\n");
+  const allLines = fs.readFileSync(originalFile, 'utf-8').split('\n');
   const targetIdx = line - 1;
 
   if (targetIdx < 0 || targetIdx >= allLines.length) {
@@ -119,15 +119,15 @@ export async function retrieveCodeContext(
   const body: string[] = [];
   for (let i = start; i <= end; i++) {
     const lineNum = String(i + 1).padStart(5);
-    const marker = i === targetIdx ? ">" : " ";
+    const marker = i === targetIdx ? '>' : ' ';
     body.push(`${marker} ${lineNum} │ ${allLines[i]}`);
     if (i === targetIdx && column > 0) {
-      const indent = " ".repeat(8 + column);
+      const indent = ' '.repeat(8 + column);
       body.push(`        │ ${indent}^`);
     }
   }
 
-  return [...header, ...body].join("\n");
+  return [...header, ...body].join('\n');
 }
 
 function collectJsFiles(dir: string, _root: string): string[] {
@@ -136,7 +136,7 @@ function collectJsFiles(dir: string, _root: string): string[] {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       results.push(...collectJsFiles(full, _root));
-    } else if (entry.name.endsWith(".js") && !entry.name.endsWith(".min.js.map")) {
+    } else if (entry.name.endsWith('.js') && !entry.name.endsWith('.min.js.map')) {
       results.push(full);
     }
   }
@@ -161,7 +161,7 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
 
   for (const jsPath of jsFiles) {
     const relPath = path.relative(distDir, jsPath);
-    const mapPath = jsPath + ".map";
+    const mapPath = jsPath + '.map';
 
     if (!fs.existsSync(mapPath)) {
       rows.push(`  ✗ ${relPath} — no .map file`);
@@ -171,7 +171,7 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
 
     let parsed: { sources?: string[] } | null = null;
     try {
-      parsed = JSON.parse(fs.readFileSync(mapPath, "utf-8")) as { sources?: string[] };
+      parsed = JSON.parse(fs.readFileSync(mapPath, 'utf-8')) as { sources?: string[] };
     } catch {
       rows.push(`  ✗ ${relPath} — .map file is invalid JSON`);
       brokenSources++;
@@ -181,7 +181,7 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
     const sources = parsed.sources ?? [];
     const mapDir = path.dirname(mapPath);
     const missing = sources.filter((s) => {
-      if (!s || s.startsWith("webpack://") || s.startsWith("node_modules/")) return false;
+      if (!s || s.startsWith('webpack://') || s.startsWith('node_modules/')) return false;
       const resolved = path.resolve(mapDir, s);
       return !fs.existsSync(resolved);
     });
@@ -206,5 +206,5 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
     ...rows,
   ];
 
-  return lines.join("\n");
+  return lines.join('\n');
 }
