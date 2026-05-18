@@ -56,5 +56,10 @@
     "src/**/*.ts": [
       "eslint --fix"
     ]
+  },
+  "mcpName": "io.github.vola-trebla/sourcemap-retrace-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vola-trebla/sourcemap-retrace-mcp.git"
   }
 }
