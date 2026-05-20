@@ -1,6 +1,6 @@
 {
   "name": "sourcemap-retrace-mcp",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "MCP server that decodes minified production stack traces back to original TypeScript source files, lines, and columns using source maps.",
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,8 @@
   "files": [
     "dist/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "server.json"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc && chmod +x dist/index.js",

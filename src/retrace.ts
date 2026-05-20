@@ -89,17 +89,70 @@ export async function retraceStack(stackTrace: string, sourcemapDir: string): Pr
   return [summary, ...output].join('\n');
 }
 
+export function normalizeBundlerPath(
+  rawPath: string,
+  projectRoot?: string,
+  sourceRoot?: string,
+): string {
+  let cleaned = rawPath;
+
+  // 1. Strip protocol prefixes (e.g. webpack://, ng://, deno://, etc.)
+  const protocolMatch = /^([a-z0-9+-.]+):\/\/(.*)$/i.exec(cleaned);
+  if (protocolMatch) {
+    const protocol = protocolMatch[1];
+    const rest = protocolMatch[2];
+    cleaned = rest;
+    if (protocol.toLowerCase() === 'webpack') {
+      if (cleaned.startsWith('/')) {
+        cleaned = cleaned.slice(1);
+      } else {
+        const parts = cleaned.split('/');
+        if (parts.length > 1) {
+          if (parts[1] === '.') {
+            cleaned = parts.slice(2).join('/');
+          } else {
+            cleaned = parts.slice(1).join('/');
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Strip Vite-specific prefix /@fs/
+  if (cleaned.startsWith('/@fs/')) {
+    cleaned = cleaned.slice(4); // Keep the leading slash to make it an absolute path
+  }
+
+  // 3. Resolve relative traversals using sourceRoot or projectRoot
+  if (sourceRoot) {
+    cleaned = path.join(sourceRoot, cleaned);
+  }
+
+  if (projectRoot && !path.isAbsolute(cleaned)) {
+    cleaned = path.resolve(projectRoot, cleaned);
+  }
+
+  return path.normalize(cleaned);
+}
+
 export async function retrieveCodeContext(
   originalFile: string,
   line: number,
   column: number,
   contextLines: number,
+  projectRoot?: string,
+  sourceRoot?: string,
 ): Promise<string> {
-  if (!fs.existsSync(originalFile)) {
-    return `Error: file not found: ${originalFile}`;
+  const normalizedFile = normalizeBundlerPath(
+    originalFile,
+    projectRoot || process.cwd(),
+    sourceRoot,
+  );
+  if (!fs.existsSync(normalizedFile)) {
+    return `Error: file not found: ${originalFile} (normalized: ${normalizedFile})`;
   }
 
-  const allLines = fs.readFileSync(originalFile, 'utf-8').split('\n');
+  const allLines = fs.readFileSync(normalizedFile, 'utf-8').split('\n');
   const targetIdx = line - 1;
 
   if (targetIdx < 0 || targetIdx >= allLines.length) {
@@ -207,4 +260,433 @@ export async function auditSourcemapMatch(distDir: string): Promise<string> {
   ];
 
   return lines.join('\n');
+}
+
+function getJsDebugId(filePath: string): string | null {
+  try {
+    const stats = fs.statSync(filePath);
+    const size = stats.size;
+    const bytesToRead = Math.min(size, 4096);
+    const buffer = Buffer.alloc(bytesToRead);
+    const fd = fs.openSync(filePath, 'r');
+    fs.readSync(fd, buffer, 0, bytesToRead, Math.max(0, size - bytesToRead));
+    fs.closeSync(fd);
+    const content = buffer.toString('utf-8');
+    const match = /(?:\/\/|#)\s*debugId\s*=\s*([0-9a-fA-F-]+)/i.exec(content);
+    return match ? match[1].toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+function getMapDebugId(mapPath: string): string | null {
+  try {
+    const content = fs.readFileSync(mapPath, 'utf-8');
+    const parsed = JSON.parse(content) as { debugId?: string };
+    return parsed.debugId ? String(parsed.debugId).toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function verifyDebugIdIntegrity(
+  jsPath: string,
+  mapPath: string,
+): Promise<{
+  js_debug_id: string | null;
+  map_debug_id: string | null;
+  ids_match: boolean;
+  verdict: 'VALID' | 'STALE' | 'NO_DEBUG_ID';
+}> {
+  if (!fs.existsSync(jsPath)) {
+    throw new Error(`JS file not found: ${jsPath}`);
+  }
+  if (!fs.existsSync(mapPath)) {
+    throw new Error(`Map file not found: ${mapPath}`);
+  }
+
+  const jsId = getJsDebugId(jsPath);
+  const mapId = getMapDebugId(mapPath);
+
+  if (!jsId || !mapId) {
+    return {
+      js_debug_id: jsId,
+      map_debug_id: mapId,
+      ids_match: false,
+      verdict: 'NO_DEBUG_ID',
+    };
+  }
+
+  const match = jsId === mapId;
+  return {
+    js_debug_id: jsId,
+    map_debug_id: mapId,
+    ids_match: match,
+    verdict: match ? 'VALID' : 'STALE',
+  };
+}
+
+export interface TelemetryFrame {
+  file: string;
+  line: number;
+  column: number;
+  functionName: string | null;
+  inApp: boolean;
+}
+
+export interface RetracedTelemetryFrame {
+  original_file: string | null;
+  line: number | null;
+  column: number | null;
+  name: string | null;
+  in_app: boolean;
+  source_line: string | null;
+}
+
+export interface IngestResult {
+  platform_detected: 'sentry' | 'bugsnag' | 'datadog' | 'unknown';
+  frames_found: number;
+  retraced_frames: RetracedTelemetryFrame[];
+}
+
+export async function ingestTelemetryPayload(
+  payloadStr: string,
+  sourcemapDir: string,
+  inAppOnly = false,
+): Promise<IngestResult> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let payload: any;
+  try {
+    payload = JSON.parse(payloadStr);
+  } catch (err) {
+    throw new Error(`Invalid JSON payload: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  let platform: 'sentry' | 'bugsnag' | 'datadog' | 'unknown' = 'unknown';
+  let extractedFrames: TelemetryFrame[] = [];
+
+  // 1. Detect Sentry
+  const exceptionValues = payload.exception?.values || payload.values;
+  if (Array.isArray(exceptionValues)) {
+    platform = 'sentry';
+    for (const value of exceptionValues) {
+      const frames = value.stacktrace?.frames;
+      if (Array.isArray(frames)) {
+        for (const f of frames) {
+          if (f.filename && f.lineno !== undefined) {
+            extractedFrames.push({
+              file: String(f.filename),
+              line: Number(f.lineno),
+              column: Number(f.colno ?? 0),
+              functionName: f.function ? String(f.function) : null,
+              inApp: f.in_app !== false,
+            });
+          }
+        }
+      }
+    }
+  } else if (payload.stacktrace?.frames) {
+    platform = 'sentry';
+    const frames = payload.stacktrace.frames;
+    if (Array.isArray(frames)) {
+      for (const f of frames) {
+        if (f.filename && f.lineno !== undefined) {
+          extractedFrames.push({
+            file: String(f.filename),
+            line: Number(f.lineno),
+            column: Number(f.colno ?? 0),
+            functionName: f.function ? String(f.function) : null,
+            inApp: f.in_app !== false,
+          });
+        }
+      }
+    }
+  }
+
+  // 2. Detect Bugsnag
+  if (platform === 'unknown' && Array.isArray(payload.events)) {
+    for (const event of payload.events) {
+      const exceptions = event.exceptions;
+      if (Array.isArray(exceptions)) {
+        platform = 'bugsnag';
+        for (const ex of exceptions) {
+          const stack = ex.stacktrace;
+          if (Array.isArray(stack)) {
+            for (const f of stack) {
+              if (f.file && f.lineNumber !== undefined) {
+                extractedFrames.push({
+                  file: String(f.file),
+                  line: Number(f.lineNumber),
+                  column: Number(f.columnNumber ?? 0),
+                  functionName: f.method ? String(f.method) : null,
+                  inApp: f.inProject !== false,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Detect Datadog / Stack String
+  if (platform === 'unknown') {
+    const stackStr =
+      payload.error?.stack || payload.stack || (typeof payload === 'string' ? payload : null);
+    if (typeof stackStr === 'string') {
+      platform = 'datadog';
+      const lines = stackStr.split('\n');
+      for (const line of lines) {
+        const match = FRAME_RE.exec(line);
+        if (match) {
+          const fnName = match[1]?.trim() || null;
+          const jsRef = (match[2] ?? match[5])!;
+          const lineNum = parseInt(match[3] ?? match[6]!, 10);
+          const colNum = parseInt(match[4] ?? match[7]!, 10);
+          extractedFrames.push({
+            file: jsRef,
+            line: lineNum,
+            column: colNum,
+            functionName: fnName,
+            inApp: true,
+          });
+        }
+      }
+    }
+  }
+
+  if (inAppOnly) {
+    extractedFrames = extractedFrames.filter((f) => f.inApp);
+  }
+
+  const retracedFrames: RetracedTelemetryFrame[] = [];
+  for (const frame of extractedFrames) {
+    const traceMap = findMap(frame.file, sourcemapDir);
+    if (!traceMap) {
+      retracedFrames.push({
+        original_file: frame.file,
+        line: frame.line,
+        column: frame.column,
+        name: frame.functionName,
+        in_app: frame.inApp,
+        source_line: null,
+      });
+      continue;
+    }
+
+    try {
+      const pos = originalPositionFor(traceMap, { line: frame.line, column: frame.column });
+      if (pos.source !== null) {
+        let sourceLine: string | null = null;
+        const normalizedFile = normalizeBundlerPath(pos.source, process.cwd());
+        if (fs.existsSync(normalizedFile)) {
+          try {
+            const fileLines = fs.readFileSync(normalizedFile, 'utf-8').split('\n');
+            if (pos.line !== null && pos.line > 0 && pos.line <= fileLines.length) {
+              sourceLine = fileLines[pos.line - 1].trim();
+            }
+          } catch {
+            // Ignore if source file cannot be read
+          }
+        }
+        retracedFrames.push({
+          original_file: pos.source,
+          line: pos.line,
+          column: pos.column,
+          name: pos.name ?? frame.functionName,
+          in_app: frame.inApp,
+          source_line: sourceLine,
+        });
+      } else {
+        retracedFrames.push({
+          original_file: frame.file,
+          line: frame.line,
+          column: frame.column,
+          name: frame.functionName,
+          in_app: frame.inApp,
+          source_line: null,
+        });
+      }
+    } catch {
+      retracedFrames.push({
+        original_file: frame.file,
+        line: frame.line,
+        column: frame.column,
+        name: frame.functionName,
+        in_app: frame.inApp,
+        source_line: null,
+      });
+    }
+  }
+
+  return {
+    platform_detected: platform,
+    frames_found: extractedFrames.length,
+    retraced_frames: retracedFrames,
+  };
+}
+
+function isAsyncBoundary(line: string): boolean {
+  const lower = line.toLowerCase();
+  return (
+    lower.includes('async') ||
+    lower.includes('await') ||
+    lower.includes('promise.then') ||
+    lower.includes('processticksandmicrotasks') ||
+    lower.includes('nexttick')
+  );
+}
+
+export interface AsyncCausalityResult {
+  crash_frame: {
+    file: string | null;
+    line: number | null;
+    column: number | null;
+    name: string | null;
+    source_line: string | null;
+  } | null;
+  async_boundary_detected: boolean;
+  async_origin_frame: {
+    file: string | null;
+    line: number | null;
+    column: number | null;
+    name: string | null;
+    source_line: string | null;
+  } | null;
+  boundary_type: 'await' | 'promise_then' | 'nexttick' | 'other' | null;
+}
+
+export async function surfaceAsyncCausality(
+  stackTrace: string,
+  sourcemapDir: string,
+): Promise<AsyncCausalityResult> {
+  const lines = stackTrace.split('\n');
+  const parsedFrames: Array<{
+    file: string;
+    line: number;
+    column: number;
+    name: string | null;
+    isBoundary: boolean;
+    rawLine: string;
+  }> = [];
+
+  for (const line of lines) {
+    const match = FRAME_RE.exec(line);
+    if (match) {
+      const fnName = match[1]?.trim() || null;
+      const jsRef = (match[2] ?? match[5])!;
+      const lineNum = parseInt(match[3] ?? match[6]!, 10);
+      const colNum = parseInt(match[4] ?? match[7]!, 10);
+      const isBoundary = isAsyncBoundary(line);
+      parsedFrames.push({
+        file: jsRef,
+        line: lineNum,
+        column: colNum,
+        name: fnName,
+        isBoundary,
+        rawLine: line,
+      });
+    } else if (isAsyncBoundary(line)) {
+      parsedFrames.push({
+        file: '',
+        line: 0,
+        column: 0,
+        name: null,
+        isBoundary: true,
+        rawLine: line,
+      });
+    }
+  }
+
+  if (parsedFrames.length === 0) {
+    return {
+      crash_frame: null,
+      async_boundary_detected: false,
+      async_origin_frame: null,
+      boundary_type: null,
+    };
+  }
+
+  const firstCrashFrameIndex = parsedFrames.findIndex((f) => !f.isBoundary);
+  const crashFrameRaw = firstCrashFrameIndex >= 0 ? parsedFrames[firstCrashFrameIndex] : null;
+
+  const asyncBoundaryIndex = parsedFrames.findIndex((f) => f.isBoundary);
+  let asyncOriginRaw: (typeof parsedFrames)[0] | null = null;
+  let boundaryType: 'await' | 'promise_then' | 'nexttick' | 'other' | null = null;
+
+  if (asyncBoundaryIndex >= 0) {
+    const originIndex = parsedFrames.findIndex(
+      (f, idx) => idx > asyncBoundaryIndex && !f.isBoundary,
+    );
+    if (originIndex >= 0) {
+      asyncOriginRaw = parsedFrames[originIndex];
+    }
+
+    const boundaryLine = parsedFrames[asyncBoundaryIndex].rawLine.toLowerCase();
+    if (boundaryLine.includes('promise.then')) {
+      boundaryType = 'promise_then';
+    } else if (boundaryLine.includes('ticks') || boundaryLine.includes('nexttick')) {
+      boundaryType = 'nexttick';
+    } else if (boundaryLine.includes('await') || boundaryLine.includes('async')) {
+      boundaryType = 'await';
+    } else {
+      boundaryType = 'other';
+    }
+  }
+
+  const mapFrame = (rawFrame: (typeof parsedFrames)[0] | null) => {
+    if (!rawFrame || !rawFrame.file) return null;
+    const traceMap = findMap(rawFrame.file, sourcemapDir);
+    if (!traceMap) {
+      return {
+        file: rawFrame.file,
+        line: rawFrame.line,
+        column: rawFrame.column,
+        name: rawFrame.name,
+        source_line: null,
+      };
+    }
+
+    try {
+      const pos = originalPositionFor(traceMap, { line: rawFrame.line, column: rawFrame.column });
+      if (pos.source !== null) {
+        let sourceLine: string | null = null;
+        const normalizedFile = normalizeBundlerPath(pos.source, process.cwd());
+        if (fs.existsSync(normalizedFile)) {
+          try {
+            const fileLines = fs.readFileSync(normalizedFile, 'utf-8').split('\n');
+            if (pos.line !== null && pos.line > 0 && pos.line <= fileLines.length) {
+              sourceLine = fileLines[pos.line - 1].trim();
+            }
+          } catch {
+            // Ignore if source file cannot be read
+          }
+        }
+        return {
+          file: pos.source,
+          line: pos.line,
+          column: pos.column,
+          name: pos.name ?? rawFrame.name,
+          source_line: sourceLine,
+        };
+      }
+    } catch {
+      // Ignore if positioning failed
+    }
+
+    return {
+      file: rawFrame.file,
+      line: rawFrame.line,
+      column: rawFrame.column,
+      name: rawFrame.name,
+      source_line: null,
+    };
+  };
+
+  return {
+    crash_frame: mapFrame(crashFrameRaw),
+    async_boundary_detected: asyncBoundaryIndex >= 0,
+    async_origin_frame: mapFrame(asyncOriginRaw),
+    boundary_type: boundaryType,
+  };
 }
