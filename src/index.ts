@@ -5,7 +5,7 @@ import { z } from 'zod/v4';
 
 const server = new McpServer({
   name: 'sourcemap-retrace-mcp',
-  version: '0.1.0',
+  version: '0.2.0',
 });
 
 server.tool(
@@ -58,6 +58,84 @@ server.tool(
     const { auditSourcemapMatch } = await import('./retrace.js');
     const text = await auditSourcemapMatch(distDir);
     return { content: [{ type: 'text', text }] };
+  },
+);
+
+server.tool(
+  'verify_debug_id_integrity',
+  'Validate that a minified production bundle matches its source map using embedded Debug IDs.',
+  {
+    jsPath: z.string().describe('Absolute path to the compiled JS file'),
+    mapPath: z.string().describe('Absolute path to the .map file'),
+  },
+  async ({ jsPath, mapPath }) => {
+    const { verifyDebugIdIntegrity } = await import('./retrace.js');
+    const result = await verifyDebugIdIntegrity(jsPath, mapPath);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+server.tool(
+  'normalize_bundler_paths',
+  'Resolve dynamic bundle references (like webpack://, ng://, or Vite /@fs/ paths) to raw files.',
+  {
+    rawPath: z.string().describe('The raw source path reference from the source map'),
+    projectRoot: z.string().optional().describe('Root directory of the project'),
+    sourceRoot: z.string().optional().describe('Source root configuration from the source map'),
+  },
+  async ({ rawPath, projectRoot, sourceRoot }) => {
+    const { normalizeBundlerPath } = await import('./retrace.js');
+    const normalized = normalizeBundlerPath(rawPath, projectRoot, sourceRoot);
+    const fs = await import('fs');
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              raw_path: rawPath,
+              normalized_path: normalized,
+              file_exists: fs.existsSync(normalized),
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  'ingest_telemetry_payload',
+  'Directly ingest Sentry, Bugsnag, or Datadog crash dumps and return fully retraced stack frames.',
+  {
+    payload: z.string().describe('The raw JSON string of the crash telemetry event'),
+    sourcemapDir: z.string().describe('Directory containing corresponding .map files'),
+    inAppOnly: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe('Only return frames marked as part of the application source code'),
+  },
+  async ({ payload, sourcemapDir, inAppOnly }) => {
+    const { ingestTelemetryPayload } = await import('./retrace.js');
+    const result = await ingestTelemetryPayload(payload, sourcemapDir, inAppOnly);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+server.tool(
+  'surface_async_causality',
+  'Detect and trace across async boundaries (e.g. await, processTicksAndMicrotasks) to locate scheduling origins.',
+  {
+    stackTrace: z.string().describe('The minified stack trace with async boundary markers'),
+    sourcemapDir: z.string().describe('Directory containing corresponding .map files'),
+  },
+  async ({ stackTrace, sourcemapDir }) => {
+    const { surfaceAsyncCausality } = await import('./retrace.js');
+    const result = await surfaceAsyncCausality(stackTrace, sourcemapDir);
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   },
 );
 
